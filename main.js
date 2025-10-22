@@ -52,6 +52,9 @@ function initGame() {
 
   initPointerLock(renderer.domElement);
   const playerState = createPlayerState();
+  
+  // Set initial camera look direction (forward, not up)
+  setLook(0, 0); // yaw=0 (forward), pitch=0 (level)
 
   // === GAME STATE ===
   let currentRoomIndex = 1;

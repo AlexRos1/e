@@ -1,327 +1,583 @@
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Dungeon Crawler</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    html, body { 
-      margin: 0; 
-      height: 100%; 
-      overflow: hidden; 
-      font-family: 'Courier New', monospace;
-      background: #000;
+// main.js
+import { createPlayerObject, initPointerLock, applyLookRotation, setLook } from './camera.js';
+import { createPlayerState, updateMovement } from './movement.js';
+import { initRooms, buildRoom, clearCurrentRoom, world, ROOM_SIZE } from './rooms.js';
+
+console.log('main.js loaded');
+
+// Wait for THREE to be available
+function initGame() {
+  if (typeof THREE === 'undefined') {
+    console.error('THREE.js not loaded yet, retrying...');
+    setTimeout(initGame, 100);
+    return;
+  }
+  
+  console.log('THREE.js loaded, initializing game...');
+
+  // === SCENE SETUP ===
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0f1a);
+  scene.fog = new THREE.Fog(0x0b0f1a, 1, 30);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  document.body.appendChild(renderer.domElement);
+  
+  console.log('Renderer created');
+
+  const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+  // === PLAYER STATE ===
+  const player = {
+    pos: new THREE.Vector3(0, 1.6, 0),
+    velocity: new THREE.Vector3(),
+    speed: 4.0,
+    jumpSpeed: 6.0,
+    radius: 0.25,
+    onGround: false,
+    health: 100,
+    maxHealth: 100,
+    alive: true,
+    score: 0,
+    kills: 0
+  };
+
+  const playerObject = createPlayerObject(player.pos.clone());
+  scene.add(playerObject);
+  playerObject.add(camera);
+  camera.position.set(0, 0, 0);
+
+  initPointerLock(renderer.domElement);
+  const playerState = createPlayerState();
+  
+  // Set initial camera look direction (forward, not up)
+  setLook(0, 0); // yaw=0 (forward), pitch=0 (level)
+
+  // === GAME STATE ===
+  let currentRoomIndex = 1;
+  let enemies = [];
+  let projectiles = [];
+  let particleEffects = [];
+  let gameRunning = true;
+
+  // === MATERIALS ===
+  const floorMat = new THREE.MeshStandardMaterial({ 
+    color: 0x22272f,
+    roughness: 0.8,
+    metalness: 0.2
+  });
+
+  const enemyMat = new THREE.MeshStandardMaterial({ 
+    color: 0xff3333,
+    emissive: 0x440000,
+    roughness: 0.6
+  });
+
+  const projectileMat = new THREE.MeshStandardMaterial({
+    color: 0xffff00,
+    emissive: 0xffaa00,
+    emissiveIntensity: 0.8
+  });
+
+  // === LIGHTING ===
+  const ambient = new THREE.AmbientLight(0x404866, 0.4);
+  scene.add(ambient);
+
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(5, 10, 5);
+  dirLight.castShadow = true;
+  dirLight.shadow.mapSize.width = 2048;
+  dirLight.shadow.mapSize.height = 2048;
+  dirLight.shadow.camera.near = 0.5;
+  dirLight.shadow.camera.far = 50;
+  dirLight.shadow.camera.left = -15;
+  dirLight.shadow.camera.right = 15;
+  dirLight.shadow.camera.top = 15;
+  dirLight.shadow.camera.bottom = -15;
+  scene.add(dirLight);
+
+  // Point light that follows player
+  const playerLight = new THREE.PointLight(0x6688ff, 0.6, 8);
+  playerLight.position.copy(player.pos);
+  scene.add(playerLight);
+  
+  console.log('Lights added');
+
+  // === ENEMY CLASS ===
+  class Enemy {
+    constructor(position, roomIndex) {
+      this.health = 30 + roomIndex * 5;
+      this.maxHealth = this.health;
+      this.speed = 1.2 + roomIndex * 0.1;
+      this.damage = 10 + roomIndex * 2;
+      this.attackCooldown = 0;
+      this.hitCooldown = 0;
+      
+      const geometry = new THREE.BoxGeometry(0.6, 1.2, 0.6);
+      this.mesh = new THREE.Mesh(geometry, enemyMat.clone());
+      this.mesh.position.copy(position);
+      this.mesh.castShadow = true;
+      scene.add(this.mesh);
+      
+      // Health bar
+      this.createHealthBar();
     }
     
-    canvas { 
-      display: block; 
-      cursor: crosshair;
+    createHealthBar() {
+      const barWidth = 0.8;
+      const barHeight = 0.1;
+      const barGeo = new THREE.PlaneGeometry(barWidth, barHeight);
+      
+      this.healthBarBg = new THREE.Mesh(barGeo, 
+        new THREE.MeshBasicMaterial({ color: 0x330000, side: THREE.DoubleSide }));
+      this.healthBarBg.position.set(0, 0.8, 0);
+      this.mesh.add(this.healthBarBg);
+      
+      this.healthBarFg = new THREE.Mesh(barGeo,
+        new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide }));
+      this.healthBarFg.position.set(0, 0.8, 0.01);
+      this.mesh.add(this.healthBarFg);
     }
     
-    /* HUD - Top Left */
-    #ui {
-      position: absolute;
-      top: 20px;
-      left: 20px;
-      z-index: 10;
-      color: #fff;
-      background: linear-gradient(135deg, rgba(0,0,0,0.7), rgba(20,20,40,0.7));
-      padding: 15px 20px;
-      border-radius: 10px;
-      border: 2px solid rgba(100, 150, 255, 0.3);
-      box-shadow: 0 0 20px rgba(0,0,0,0.5);
-      min-width: 200px;
-    }
-    
-    #hud { 
-      font-size: 16px; 
-      line-height: 1.8;
-    }
-    
-    #hud > div {
-      margin: 5px 0;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    
-    #hud span {
-      font-weight: bold;
-      color: #4af;
-      text-shadow: 0 0 5px rgba(100, 200, 255, 0.5);
-    }
-    
-    /* Health Bar */
-    .health-container {
-      display: flex;
-      flex-direction: column;
-      gap: 5px;
-    }
-    
-    .health-bar {
-      width: 100%;
-      height: 20px;
-      background: rgba(50, 0, 0, 0.8);
-      border-radius: 10px;
-      overflow: hidden;
-      border: 1px solid rgba(255, 100, 100, 0.3);
-    }
-    
-    .health-fill {
-      height: 100%;
-      background: linear-gradient(90deg, #f00, #f60);
-      transition: width 0.3s ease;
-      box-shadow: 0 0 10px rgba(255, 0, 0, 0.5);
-    }
-    
-    /* Score Display */
-    #scoreDisplay {
-      text-align: center;
-      font-size: 18px;
-      color: #ff0;
-      text-shadow: 0 0 10px rgba(255, 255, 0, 0.5);
-      margin-top: 10px;
-      padding-top: 10px;
-      border-top: 1px solid rgba(100, 150, 255, 0.2);
-    }
-    
-    /* Instructions - Bottom Left */
-    #instructions {
-      position: absolute;
-      bottom: 20px;
-      left: 20px;
-      z-index: 10;
-      color: #ddd;
-      background: rgba(0, 0, 0, 0.6);
-      padding: 12px 18px;
-      border-radius: 8px;
-      font-size: 13px;
-      border: 1px solid rgba(100, 150, 255, 0.2);
-      line-height: 1.6;
-    }
-    
-    #instructions div {
-      margin: 3px 0;
-    }
-    
-    .key {
-      display: inline-block;
-      background: rgba(255, 255, 255, 0.1);
-      padding: 2px 8px;
-      border-radius: 4px;
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      font-weight: bold;
-      color: #4af;
-    }
-    
-    /* Crosshair */
-    #crosshair {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      z-index: 5;
-      pointer-events: none;
-    }
-    
-    .crosshair-line {
-      position: absolute;
-      background: rgba(255, 255, 255, 0.8);
-      box-shadow: 0 0 5px rgba(255, 255, 255, 0.5);
-    }
-    
-    .crosshair-h {
-      width: 20px;
-      height: 2px;
-      left: -10px;
-      top: -1px;
-    }
-    
-    .crosshair-v {
-      width: 2px;
-      height: 20px;
-      left: -1px;
-      top: -10px;
-    }
-    
-    .crosshair-center {
-      width: 4px;
-      height: 4px;
-      left: -2px;
-      top: -2px;
-      border-radius: 50%;
-      background: rgba(255, 100, 100, 0.6);
-    }
-    
-    /* Game Over Overlay */
-    #overlay {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 20;
-      pointer-events: none;
-      background: rgba(0, 0, 0, 0);
-      transition: background 0.3s ease;
-    }
-    
-    #overlay.active {
-      background: rgba(0, 0, 0, 0.7);
-      pointer-events: auto;
-    }
-    
-    #gameOver {
-      display: none;
-      pointer-events: auto;
-      background: linear-gradient(135deg, rgba(20, 20, 40, 0.95), rgba(40, 20, 60, 0.95));
-      color: #fff;
-      padding: 40px;
-      border-radius: 15px;
-      text-align: center;
-      width: 400px;
-      border: 3px solid rgba(100, 150, 255, 0.4);
-      box-shadow: 0 0 40px rgba(100, 150, 255, 0.3);
-      animation: slideIn 0.5s ease;
-    }
-    
-    @keyframes slideIn {
-      from {
-        transform: translateY(-50px);
-        opacity: 0;
-      }
-      to {
-        transform: translateY(0);
-        opacity: 1;
+    update(delta) {
+      if (this.hitCooldown > 0) this.hitCooldown -= delta;
+      if (this.attackCooldown > 0) this.attackCooldown -= delta;
+      
+      // Update health bar
+      const healthPercent = this.health / this.maxHealth;
+      this.healthBarFg.scale.x = healthPercent;
+      this.healthBarFg.position.x = -0.4 * (1 - healthPercent);
+      
+      // Billboard health bar to face camera
+      this.healthBarBg.lookAt(camera.getWorldPosition(new THREE.Vector3()));
+      this.healthBarFg.lookAt(camera.getWorldPosition(new THREE.Vector3()));
+      
+      // AI: Move toward player
+      const toPlayer = new THREE.Vector3().subVectors(player.pos, this.mesh.position);
+      const dist = toPlayer.length();
+      
+      if (dist > 1.5) {
+        // Move toward player
+        toPlayer.y = 0;
+        toPlayer.normalize();
+        const movement = toPlayer.multiplyScalar(this.speed * delta);
+        
+        const newPos = this.mesh.position.clone().add(movement);
+        if (!checkCollisionWithWalls(newPos, 0.3)) {
+          this.mesh.position.copy(newPos);
+        }
+      } else if (dist < 1.5 && this.attackCooldown <= 0 && player.alive) {
+        // Attack player
+        this.attack();
       }
     }
     
-    #gameOverTitle {
-      font-size: 48px;
-      margin: 0 0 20px 0;
-      text-shadow: 0 0 20px rgba(255, 100, 100, 0.8);
-      color: #f44;
+    attack() {
+      this.attackCooldown = 1.5;
+      damagePlayer(this.damage);
+      
+      // Visual feedback
+      this.mesh.material.emissive.setHex(0xff0000);
+      setTimeout(() => {
+        if (this.mesh.material) this.mesh.material.emissive.setHex(0x440000);
+      }, 200);
     }
     
-    #gameOverTitle.win {
-      color: #4f4;
-      text-shadow: 0 0 20px rgba(100, 255, 100, 0.8);
+    takeDamage(amount) {
+      if (this.hitCooldown > 0) return false;
+      
+      this.health -= amount;
+      this.hitCooldown = 0.1;
+      
+      // Flash white
+      this.mesh.material.emissive.setHex(0xffffff);
+      setTimeout(() => {
+        if (this.mesh.material) this.mesh.material.emissive.setHex(0x440000);
+      }, 100);
+      
+      if (this.health <= 0) {
+        this.die();
+        return true;
+      }
+      return false;
     }
     
-    #gameOverText {
-      font-size: 16px;
-      line-height: 1.6;
-      margin: 20px 0 30px 0;
-      color: #ccc;
+    die() {
+      createParticleExplosion(this.mesh.position, 0xff3333);
+      scene.remove(this.mesh);
+      player.kills++;
+      player.score += 100;
+      updateUI();
+    }
+  }
+
+  // === PROJECTILE CLASS ===
+  class Projectile {
+    constructor(position, direction) {
+      const geometry = new THREE.SphereGeometry(0.1, 8, 8);
+      this.mesh = new THREE.Mesh(geometry, projectileMat.clone());
+      this.mesh.position.copy(position);
+      this.mesh.castShadow = true;
+      scene.add(this.mesh);
+      
+      this.velocity = direction.normalize().multiplyScalar(20);
+      this.lifetime = 3;
+      this.damage = 25;
+      
+      // Add glow
+      const light = new THREE.PointLight(0xffaa00, 0.5, 3);
+      this.mesh.add(light);
     }
     
-    #restartBtn {
-      background: linear-gradient(135deg, #4a90e2, #357abd);
-      color: white;
-      border: none;
-      padding: 15px 40px;
-      font-size: 18px;
-      font-weight: bold;
-      border-radius: 8px;
-      cursor: pointer;
-      transition: all 0.3s ease;
-      box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
-      font-family: 'Courier New', monospace;
+    update(delta) {
+      this.lifetime -= delta;
+      if (this.lifetime <= 0) return false;
+      
+      const movement = this.velocity.clone().multiplyScalar(delta);
+      this.mesh.position.add(movement);
+      
+      // Check collision with walls
+      if (checkCollisionWithWalls(this.mesh.position, 0.1)) {
+        createParticleExplosion(this.mesh.position, 0xffff00);
+        scene.remove(this.mesh);
+        return false;
+      }
+      
+      // Check collision with enemies
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        const enemy = enemies[i];
+        const dist = this.mesh.position.distanceTo(enemy.mesh.position);
+        if (dist < 0.5) {
+          if (enemy.takeDamage(this.damage)) {
+            enemies.splice(i, 1);
+            checkRoomComplete();
+          }
+          createParticleExplosion(this.mesh.position, 0xffaa00);
+          scene.remove(this.mesh);
+          return false;
+        }
+      }
+      
+      return true;
+    }
+  }
+
+  // === PARTICLE EFFECTS ===
+  function createParticleExplosion(position, color) {
+    const particleCount = 15;
+    for (let i = 0; i < particleCount; i++) {
+      const geometry = new THREE.SphereGeometry(0.05, 4, 4);
+      const material = new THREE.MeshBasicMaterial({ color });
+      const particle = new THREE.Mesh(geometry, material);
+      particle.position.copy(position);
+      scene.add(particle);
+      
+      const velocity = new THREE.Vector3(
+        (Math.random() - 0.5) * 3,
+        Math.random() * 3,
+        (Math.random() - 0.5) * 3
+      );
+      
+      particleEffects.push({
+        mesh: particle,
+        velocity,
+        lifetime: 0.5,
+        maxLifetime: 0.5
+      });
+    }
+  }
+
+  function updateParticles(delta) {
+    for (let i = particleEffects.length - 1; i >= 0; i--) {
+      const p = particleEffects[i];
+      p.lifetime -= delta;
+      
+      if (p.lifetime <= 0) {
+        scene.remove(p.mesh);
+        particleEffects.splice(i, 1);
+        continue;
+      }
+      
+      p.velocity.y -= 5 * delta; // Gravity
+      p.mesh.position.add(p.velocity.clone().multiplyScalar(delta));
+      
+      const alpha = p.lifetime / p.maxLifetime;
+      p.mesh.scale.setScalar(alpha);
+    }
+  }
+
+  // === COLLISION DETECTION ===
+  function checkCollisionWithWalls(position, radius) {
+    for (const wall of world.walls) {
+      if (aabbSphereCollision(wall.min, wall.max, position, radius)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function aabbSphereCollision(boxMin, boxMax, sphereCenter, sphereRadius) {
+    const closestPoint = new THREE.Vector3(
+      Math.max(boxMin.x, Math.min(sphereCenter.x, boxMax.x)),
+      Math.max(boxMin.y, Math.min(sphereCenter.y, boxMax.y)),
+      Math.max(boxMin.z, Math.min(sphereCenter.z, boxMax.z))
+    );
+    const dist = sphereCenter.distanceTo(closestPoint);
+    return dist < sphereRadius;
+  }
+
+  // === SHOOTING ===
+  let canShoot = true;
+  renderer.domElement.addEventListener('mousedown', (e) => {
+    if (e.button === 0 && canShoot && player.alive && document.pointerLockElement) {
+      shoot();
+      canShoot = false;
+      setTimeout(() => canShoot = true, 250); // Fire rate
+    }
+  });
+
+  function shoot() {
+    const shootOrigin = camera.getWorldPosition(new THREE.Vector3());
+    const shootDir = new THREE.Vector3(0, 0, -1)
+      .applyQuaternion(camera.getWorldQuaternion(new THREE.Quaternion()));
+    
+    projectiles.push(new Projectile(shootOrigin, shootDir));
+    
+    // Muzzle flash
+    createParticleExplosion(shootOrigin.add(shootDir.multiplyScalar(0.3)), 0xffaa00);
+  }
+
+  // === ENEMY SPAWNING ===
+  function spawnEnemies(count, roomIndex) {
+    enemies = [];
+    const half = ROOM_SIZE / 2;
+    
+    for (let i = 0; i < count; i++) {
+      let position;
+      let attempts = 0;
+      do {
+        position = new THREE.Vector3(
+          (Math.random() - 0.5) * ROOM_SIZE * 0.7,
+          0.6,
+          (Math.random() - 0.5) * ROOM_SIZE * 0.7
+        );
+        attempts++;
+      } while (position.distanceTo(player.pos) < 3 && attempts < 20);
+      
+      enemies.push(new Enemy(position, roomIndex));
+    }
+    updateUI();
+  }
+
+  // === PLAYER DAMAGE ===
+  function damagePlayer(amount) {
+    if (!player.alive) return;
+    
+    player.health -= amount;
+    if (player.health <= 0) {
+      player.health = 0;
+      player.alive = false;
+      gameOver();
     }
     
-    #restartBtn:hover {
-      background: linear-gradient(135deg, #357abd, #2868a8);
-      transform: translateY(-2px);
-      box-shadow: 0 7px 20px rgba(0, 0, 0, 0.4);
-    }
+    // Screen flash effect
+    scene.background.setHex(0x330000);
+    setTimeout(() => scene.background.setHex(0x0b0f1a), 100);
     
-    #restartBtn:active {
-      transform: translateY(0);
+    updateUI();
+  }
+
+  // === ROOM PROGRESSION ===
+  function checkRoomComplete() {
+    if (enemies.length === 0 && gameRunning) {
+      // Room cleared!
+      player.score += 500 * currentRoomIndex;
+      updateUI();
+      
+      // Show "Room Cleared" message
+      const msg = document.getElementById('roomClearedMsg');
+      if (msg) {
+        msg.classList.add('show');
+        setTimeout(() => msg.classList.remove('show'), 1500);
+      }
+      
+      setTimeout(() => {
+        if (currentRoomIndex >= 5) {
+          gameWin();
+        } else {
+          nextRoom();
+        }
+      }, 2000);
     }
+  }
+
+  function nextRoom() {
+    currentRoomIndex++;
+    clearProjectiles();
+    buildRoom(currentRoomIndex);
+    playerObject.position.copy(player.pos);
+    player.health = Math.min(player.maxHealth, player.health + 20); // Heal between rooms
+    updateUI();
+  }
+
+  function clearProjectiles() {
+    projectiles.forEach(p => scene.remove(p.mesh));
+    projectiles = [];
+  }
+
+  // === UI UPDATES ===
+  function updateUI() {
+    const health = Math.max(0, player.health);
+    document.getElementById('health').textContent = health;
+    document.getElementById('room').textContent = currentRoomIndex;
+    document.getElementById('enemiesCount').textContent = enemies.length;
+    document.getElementById('score').textContent = player.score;
     
-    /* Room Cleared Message */
-    #roomClearedMsg {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      z-index: 15;
-      font-size: 48px;
-      color: #4f4;
-      text-shadow: 0 0 20px rgba(100, 255, 100, 0.8);
-      font-weight: bold;
-      pointer-events: none;
-      opacity: 0;
-      transition: opacity 0.3s ease;
+    // Update health bar
+    const healthPercent = (health / player.maxHealth) * 100;
+    const healthBar = document.getElementById('healthBar');
+    if (healthBar) {
+      healthBar.style.width = healthPercent + '%';
     }
+  }
+
+  // === GAME OVER / WIN ===
+  function gameOver() {
+    gameRunning = false;
+    const overlay = document.getElementById('overlay');
+    const gameOverDiv = document.getElementById('gameOver');
+    const title = document.getElementById('gameOverTitle');
     
-    #roomClearedMsg.show {
-      opacity: 1;
+    title.textContent = 'Game Over';
+    title.classList.remove('win');
+    
+    document.getElementById('gameOverText').textContent = 
+      `You died on room ${currentRoomIndex}. Score: ${player.score} | Kills: ${player.kills}`;
+    
+    if (overlay) overlay.classList.add('active');
+    if (gameOverDiv) gameOverDiv.style.display = 'block';
+  }
+
+  function gameWin() {
+    gameRunning = false;
+    const overlay = document.getElementById('overlay');
+    const gameOverDiv = document.getElementById('gameOver');
+    const title = document.getElementById('gameOverTitle');
+    
+    title.textContent = 'Victory!';
+    title.classList.add('win');
+    
+    document.getElementById('gameOverText').textContent = 
+      `You cleared all rooms! Final Score: ${player.score} | Total Kills: ${player.kills}`;
+    
+    if (overlay) overlay.classList.add('active');
+    if (gameOverDiv) gameOverDiv.style.display = 'block';
+  }
+
+  // === RESET GAME ===
+  function resetGame() {
+    gameRunning = true;
+    currentRoomIndex = 1;
+    player.health = player.maxHealth;
+    player.alive = true;
+    player.score = 0;
+    player.kills = 0;
+    
+    enemies.forEach(e => scene.remove(e.mesh));
+    enemies = [];
+    clearProjectiles();
+    particleEffects.forEach(p => scene.remove(p.mesh));
+    particleEffects = [];
+    
+    const overlay = document.getElementById('overlay');
+    const gameOverDiv = document.getElementById('gameOver');
+    if (overlay) overlay.classList.remove('active');
+    if (gameOverDiv) gameOverDiv.style.display = 'none';
+    
+    setLook(0, 0); // Reset camera look
+    buildRoom(1);
+    playerObject.position.copy(player.pos);
+    updateUI();
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyR') {
+      resetGame();
     }
-  </style>
-</head>
-<body>
-  <!-- HUD -->
-  <div id="ui">
-    <div id="hud">
-      <div class="health-container">
-        <div style="display: flex; justify-content: space-between;">
-          <span>Health</span>
-          <span id="health">100</span>
-        </div>
-        <div class="health-bar">
-          <div class="health-fill" id="healthBar" style="width: 100%"></div>
-        </div>
-      </div>
-      <div>
-        <span>Room</span>
-        <span id="room">1</span>
-      </div>
-      <div>
-        <span>Enemies</span>
-        <span id="enemiesCount">0</span>
-      </div>
-      <div id="scoreDisplay">
-        Score: <span id="score">0</span>
-      </div>
-    </div>
-  </div>
+  });
+
+  document.getElementById('restartBtn').addEventListener('click', resetGame);
+
+  // === INITIALIZE ROOMS ===
+  initRooms({
+    scene,
+    floorMaterial: floorMat,
+    camera,
+    player,
+    spawnEnemies
+  });
+
+  buildRoom(1);
+  playerObject.position.copy(player.pos);
+  updateUI();
   
-  <!-- Crosshair -->
-  <div id="crosshair">
-    <div class="crosshair-line crosshair-h"></div>
-    <div class="crosshair-line crosshair-v"></div>
-    <div class="crosshair-center"></div>
-  </div>
-  
-  <!-- Instructions -->
-  <div id="instructions">
-    <div><strong>Controls:</strong></div>
-    <div><span class="key">WASD</span> Move</div>
-    <div><span class="key">Mouse</span> Look</div>
-    <div><span class="key">Click</span> Shoot</div>
-    <div><span class="key">Space</span> Jump</div>
-    <div><span class="key">R</span> Reset</div>
-    <div style="margin-top: 8px; font-size: 11px; color: #999;">
-      Click screen to lock pointer
-    </div>
-  </div>
-  
-  <!-- Room Cleared Message -->
-  <div id="roomClearedMsg">ROOM CLEARED!</div>
-  
-  <!-- Game Over Overlay -->
-  <div id="overlay">
-    <div id="gameOver">
-      <h1 id="gameOverTitle">Game Over</h1>
-      <p id="gameOverText">You died. Press R to restart.</p>
-      <button id="restartBtn">Restart (R)</button>
-    </div>
-  </div>
-  
-  <!-- Load THREE.js first -->
-  <script src="https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.min.js"></script>
-  <!-- Then load your game module -->
-  <script type="module" src="./main.js"></script>
-</body>
-</html>
+  console.log('Room built, starting animation loop');
+
+  // === ANIMATION LOOP ===
+  const clock = new THREE.Clock();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const delta = Math.min(0.05, clock.getDelta());
+    
+    if (!gameRunning) {
+      renderer.render(scene, camera);
+      return;
+    }
+    
+    // Update movement
+    updateMovement(playerObject, playerState, camera, scene, delta);
+    player.pos.copy(playerObject.position);
+    
+    // Update player light
+    playerLight.position.copy(player.pos);
+    
+    // Apply camera rotation
+    applyLookRotation(playerObject, camera);
+    
+    // Update enemies
+    enemies.forEach(enemy => enemy.update(delta));
+    
+    // Update projectiles
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      if (!projectiles[i].update(delta)) {
+        projectiles.splice(i, 1);
+      }
+    }
+    
+    // Update particles
+    updateParticles(delta);
+    
+    renderer.render(scene, camera);
+  }
+
+  animate();
+  console.log('Game started!');
+
+  // === RESIZE HANDLER ===
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+// Start game when page loads
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initGame);
+} else {
+  initGame();
+}
